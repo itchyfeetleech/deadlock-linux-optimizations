@@ -1,0 +1,123 @@
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+index 06163f8..b39d600 100644
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -426,6 +426,8 @@ enum
+ static volatile LONG qpc_tsc_state;
+ static volatile LONG qpc_tsc_checking;   /* one thread asking the kernel at a time */
+ static BOOL      qpc_tsc_forced;         /* WINE_ENABLE_QPC_TSC: do not follow the kernel clocksource */
++static BOOL      qpc_tsc_unordered;      /* WINE_QPC_TSC_UNORDERED: plain rdtsc, no wait for earlier instructions */
++static HANDLE    qpc_tsc_cs_handle;      /* current_clocksource, kept open for the periodic check */
+ 
+ /* written before qpc_tsc_state releases them, then constant; qpc_tsc_base_qpc is also read by
+  * calibrating callers while a pass is being closed, hence the relaxed atomics on it */
+@@ -451,10 +453,17 @@ struct qpc_tsc_sample
+     ULONGLONG tsc;
+ };
+ 
++/* rdtscp waits until every earlier instruction has executed, which in memory-bound code costs
++ * as much as the outstanding cache misses; plain rdtsc does not wait. Plain rdtsc keeps each
++ * thread monotonic but lets a reading taken after observing another thread's store come out up
++ * to a few hundred ns earlier than that thread's reading, hence opt-in. */
+ static inline ULONGLONG qpc_read_tsc(void)
+ {
+-    unsigned int aux;
+-    return __rdtscp( &aux );
++    unsigned int lo, hi;
++
++    if (qpc_tsc_unordered) return __rdtsc();
++    __asm__ __volatile__( "rdtscp" : "=a" (lo), "=d" (hi) :: "ecx" );
++    return ((ULONGLONG)hi << 32) | lo;
+ }
+ 
+ static inline LONGLONG qpc_tsc_ticks( ULONGLONG tsc )
+@@ -505,18 +514,24 @@ static int qpc_tsc_kernel_clocksource(void)
+     char buffer[16];
+     int ret = -1;
+ 
+-    RtlInitUnicodeString( &nameU,
+-        L"\\??\\unix\\sys\\devices\\system\\clocksource\\clocksource0\\current_clocksource" );
+-    InitializeObjectAttributes( &attr, &nameU, OBJ_CASE_INSENSITIVE, NULL, NULL );
+-    if (NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
+-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+-                    FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE ))
+-        return -1;
++    /* the handle stays open: reopening costs two wineserver round trips (20-60 us), a read on
++     * the open handle well under a microsecond, and the check runs inside a caller's QPC call */
++    if (!(handle = qpc_tsc_cs_handle))
++    {
++        RtlInitUnicodeString( &nameU,
++            L"\\??\\unix\\sys\\devices\\system\\clocksource\\clocksource0\\current_clocksource" );
++        InitializeObjectAttributes( &attr, &nameU, OBJ_CASE_INSENSITIVE, NULL, NULL );
++        if (NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
++                        FILE_SHARE_READ | FILE_SHARE_WRITE,
++                        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE ))
++            return -1;
++        qpc_tsc_cs_handle = handle;
++    }
+     offset.QuadPart = 0;
+     if (!NtReadFile( handle, NULL, NULL, NULL, &io, buffer, sizeof(buffer), &offset, NULL ))
+         ret = io.Information >= 3 && !memcmp( buffer, "tsc", 3 ) &&
+               (io.Information == 3 || buffer[3] == '\n');
+-    NtClose( handle );
++    else qpc_tsc_cs_handle = 0;   /* not closed: the value may have been closed and reused by the app */
+     return ret;
+ }
+ 
+@@ -549,6 +564,9 @@ static int qpc_tsc_usable(void)
+         return 0;
+     }
+ 
++    if ((qpc_tsc_unordered = qpc_tsc_env_set( L"WINE_QPC_TSC_UNORDERED" )))
++        TRACE_(qpc)( "WINE_QPC_TSC_UNORDERED set, reading the TSC with rdtsc\n" );
++
+     if ((qpc_tsc_forced = qpc_tsc_env_set( L"WINE_ENABLE_QPC_TSC" )))
+     {
+         TRACE_(qpc)( "WINE_ENABLE_QPC_TSC set, not following the kernel clocksource\n" );
+@@ -669,7 +687,7 @@ static BOOL qpc_tsc_check( ULONGLONG tsc )
+     return ok;
+ }
+ 
+-static BOOL qpc_tsc_counter( LARGE_INTEGER *counter )
++static BOOL DECLSPEC_NOINLINE qpc_tsc_counter( LARGE_INTEGER *counter )
+ {
+     /* acquire: the values published below must not be loaded before the state that releases
+      * them, which the compiler would otherwise be free to do */
+@@ -724,13 +742,35 @@ static BOOL qpc_tsc_counter( LARGE_INTEGER *counter )
+ /******************************************************************************
+  *  RtlQueryPerformanceCounter   [NTDLL.@]
+  */
++#if defined(__x86_64__) && !defined(__arm64ec__)
++static BOOL DECLSPEC_NOINLINE qpc_slow_path( LARGE_INTEGER *counter )
++{
++    if (!qpc_tsc_counter( counter )) NtQueryPerformanceCounter( counter, NULL );
++    return TRUE;
++}
++#endif
++
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
+ #if defined(__x86_64__) && !defined(__arm64ec__)
+-    if (qpc_tsc_counter( counter )) return TRUE;
+-#endif
++    /* fast path: no callee-saved registers to spill; probing, calibration, the periodic
++     * clocksource check and a TSC below the base all go through qpc_slow_path */
++    if (__atomic_load_n( &qpc_tsc_state, __ATOMIC_ACQUIRE ) == QPC_TSC_READY)
++    {
++        ULONGLONG tsc = qpc_read_tsc();
++
++        if ((LONGLONG)(tsc - qpc_tsc_base_tsc) >= 0 &&
++            tsc - __atomic_load_n( &qpc_tsc_check_start, __ATOMIC_RELAXED ) < qpc_tsc_check_step)
++        {
++            counter->QuadPart = qpc_tsc_ticks( tsc );
++            return TRUE;
++        }
++    }
++    return qpc_slow_path( counter );
++#else
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
++#endif
+ }
+ 
+ /******************************************************************************

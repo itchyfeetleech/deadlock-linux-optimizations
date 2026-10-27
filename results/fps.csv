@@ -1,0 +1,11 @@
+proton,game_setup,renderer,runs,avg_fps,low_1pct_fps,avg_fps_runs
+Proton Experimental,vanilla,vulkan,2,361.2,170.5,362.1 360.2
+Proton Experimental,vanilla,dx11,2,362.0,159.7,362.7 361.3
+GE-Proton11-11,vanilla,dx11,2,371.9,158.4,371.5 372.4
+GE-Proton11-11,vanilla,vulkan,2,372.3,171.8,373.1 371.5
+GE-Proton11-11,gameinfo,vulkan,2,385.1,191.5,384.4 385.7
+GE-Proton11-11,gameinfo + mods,vulkan,4,424.5,206.1,424.3 426.1 422.6 425.0
+GE-Proton11-11 + 0001 qpc,gameinfo + mods,vulkan,2,428.5,207.6,428.0 428.9
+GE-Proton11-11 + 0001 qpc + lsteamclient,gameinfo + mods,vulkan,2,433.9,208.5,435.2 432.7
+GE-Proton11-11 + all patches,gameinfo + mods,vulkan,4,459.8,217.3,462.1 459.5 460.4 457.3
+GE-Proton11-11 + 0001 qpc + lsteamclient + 0002 sync,gameinfo + mods,vulkan,2,460.0,215.4,460.7 459.3

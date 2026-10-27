@@ -1,0 +1,597 @@
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index b03f232..c0374a3 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5962,7 +5962,7 @@ static BOOL async_write_proc( void *user, ULONG_PTR *info, unsigned int *status
+     return TRUE;
+ }
+ 
+-static void set_sync_iosb( IO_STATUS_BLOCK *io, NTSTATUS status, ULONG_PTR info, unsigned int options )
++void set_sync_iosb( IO_STATUS_BLOCK *io, NTSTATUS status, ULONG_PTR info, unsigned int options )
+ {
+     if (in_wow64_call() && !(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)))
+     {
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 1261976..b006d39 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1087,6 +1087,16 @@ C_ASSERT( sizeof(union fd_cache_entry) == sizeof(LONG64) );
+ static union fd_cache_entry *fd_cache[FD_CACHE_ENTRIES];
+ static union fd_cache_entry fd_cache_initial_block[FD_CACHE_BLOCK_SIZE];
+ 
++/* session shared state of cached socket handles, same indexing and lifetime as fd_cache */
++struct sock_shm_cache_entry
++{
++    object_id_t                id;      /* object id, 0 if unset */
++    mem_size_t                 offset;  /* offset in the session mapping */
++    const shared_object_t     *object;  /* mapped object, resolved on first use */
++};
++
++static struct sock_shm_cache_entry *sock_shm_cache[FD_CACHE_ENTRIES];
++
+ static inline unsigned int handle_to_index( HANDLE handle, unsigned int *entry )
+ {
+     unsigned int idx = (wine_server_obj_handle(handle) >> 2) - 1;
+@@ -1135,6 +1145,118 @@ static BOOL add_fd_to_cache( HANDLE handle, int fd, enum server_fd_type type,
+ }
+ 
+ 
++/***********************************************************************
++ *           add_sock_shm_to_cache
++ *
++ * Caller must hold fd_cache_mutex.
++ */
++static void add_sock_shm_to_cache( HANDLE handle, const struct obj_locator *locator )
++{
++    unsigned int entry, idx = handle_to_index( handle, &entry );
++    struct sock_shm_cache_entry *shm;
++
++    if (entry >= FD_CACHE_ENTRIES) return;
++    if (!sock_shm_cache[entry])
++    {
++        void *ptr = anon_mmap_alloc( FD_CACHE_BLOCK_SIZE * sizeof(struct sock_shm_cache_entry),
++                                     PROT_READ | PROT_WRITE );
++        if (ptr == MAP_FAILED) return;
++        sock_shm_cache[entry] = ptr;
++    }
++    shm = &sock_shm_cache[entry][idx];
++    InterlockedExchangePointer( (void **)&shm->object, NULL );
++    shm->offset = locator->offset;
++    WriteRelease64( (LONG64 *)&shm->id, locator->id );
++}
++
++
++/* mapped blocks of the session shared mapping */
++struct session_block
++{
++    struct list entry;
++    const char *data;
++    SIZE_T      offset;
++    SIZE_T      size;
++};
++
++static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list session_blocks = LIST_INIT( session_blocks );
++
++static const shared_object_t *find_session_object( mem_size_t offset )
++{
++    static const WCHAR nameW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s','\\',
++                                  '_','_','w','i','n','e','_','s','e','s','s','i','o','n',0};
++    const SIZE_T size = sizeof(shared_object_t);
++    struct session_block *block;
++    const shared_object_t *ret = NULL;
++    UNICODE_STRING name;
++    OBJECT_ATTRIBUTES attr;
++    LARGE_INTEGER off;
++    HANDLE section;
++    sigset_t sigset;
++
++    if (offset + size < offset) return NULL;
++
++    server_enter_uninterrupted_section( &session_lock, &sigset );
++    LIST_FOR_EACH_ENTRY( block, &session_blocks, struct session_block, entry )
++    {
++        if (block->offset <= offset && offset + size <= block->offset + block->size)
++        {
++            ret = (const shared_object_t *)(block->data + offset - block->offset);
++            goto done;
++        }
++    }
++
++    if (!(block = calloc( 1, sizeof(*block) ))) goto done;
++    init_unicode_string( &name, nameW );
++    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
++    off.QuadPart = offset & ~(SIZE_T)0xffff;
++    if (!NtOpenSection( &section, SECTION_MAP_READ, &attr ))
++    {
++        if (!NtMapViewOfSection( section, GetCurrentProcess(), (void **)&block->data, 0, 0,
++                                 &off, &block->size, ViewUnmap, 0, PAGE_READONLY ))
++        {
++            block->offset = off.QuadPart;
++            if (block->offset <= offset && offset + size <= block->offset + block->size)
++            {
++                list_add_tail( &session_blocks, &block->entry );
++                ret = (const shared_object_t *)(block->data + offset - block->offset);
++                block = NULL;
++            }
++            else NtUnmapViewOfSection( GetCurrentProcess(), (void *)block->data );
++        }
++        NtClose( section );
++    }
++    free( block );
++
++done:
++    server_leave_uninterrupted_section( &session_lock, &sigset );
++    return ret;
++}
++
++
++/***********************************************************************
++ *           server_get_sock_shm
++ *
++ * Return the session shared state of a socket handle whose fd is cached, or NULL.
++ * The caller must check the object id against *id under the object seqlock.
++ */
++const shared_object_t *server_get_sock_shm( HANDLE handle, object_id_t *id )
++{
++    unsigned int entry, idx = handle_to_index( handle, &entry );
++    struct sock_shm_cache_entry *shm;
++    const shared_object_t *object;
++
++    if (entry >= FD_CACHE_ENTRIES || !sock_shm_cache[entry]) return NULL;
++    shm = &sock_shm_cache[entry][idx];
++    if (!(*id = ReadAcquire64( (LONG64 *)&shm->id ))) return NULL;
++    if ((object = __atomic_load_n( &shm->object, __ATOMIC_ACQUIRE ))) return object;
++    if (!(object = find_session_object( shm->offset ))) return NULL;
++    InterlockedCompareExchangePointer( (void **)&shm->object, (void *)object, NULL );
++    return object;
++}
++
++
+ /***********************************************************************
+  *           get_cached_fd
+  */
+@@ -1174,6 +1296,12 @@ static int remove_fd_from_cache( HANDLE handle )
+         cache.data = interlocked_xchg64( &fd_cache[entry][idx].data, 0 );
+         if (cache.s.type != FD_TYPE_INVALID) fd = cache.s.fd - 1;
+     }
++    if (entry < FD_CACHE_ENTRIES && sock_shm_cache[entry])
++    {
++        struct sock_shm_cache_entry *shm = &sock_shm_cache[entry][idx];
++        WriteRelease64( (LONG64 *)&shm->id, 0 );
++        InterlockedExchangePointer( (void **)&shm->object, NULL );
++    }
+ 
+     return fd;
+ }
+@@ -1214,6 +1342,8 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+                 if ((fd = wine_server_receive_fd( &fd_handle )) != -1)
+                 {
+                     assert( wine_server_ptr_handle(fd_handle) == handle );
++                    if (reply->cacheable && reply->type == FD_TYPE_SOCKET && reply->shm.id)
++                        add_sock_shm_to_cache( handle, &reply->shm );
+                     *needs_close = (!reply->cacheable ||
+                                     !add_fd_to_cache( handle, fd, reply->type,
+                                                       reply->access, reply->options ));
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index e4c7458..df9a785 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -918,6 +918,88 @@ static BOOL is_icmp_over_dgram( int fd )
+ #endif
+ }
+ 
++/* Read the socket state published by the server in the session shared mapping.
++ * Returns FALSE if it is not available. */
++static BOOL get_sock_shm_state( HANDLE handle, sock_shm_t *state )
++{
++    const shared_object_t *object;
++    object_id_t id, object_id;
++    unsigned int spins = 0;
++    LONG64 seq;
++
++    if (!(object = server_get_sock_shm( handle, &id ))) return FALSE;
++    for (;;)
++    {
++        while ((seq = ReadAcquire64( &object->seq )) & 1)
++        {
++            if (++spins > 4096) return FALSE;
++            YieldProcessor();
++        }
++        object_id = object->id;
++        state->pending_events = object->shm.sock.pending_events;
++        state->reported_events = object->shm.sock.reported_events;
++        state->mask = object->shm.sock.mask;
++        state->flags = object->shm.sock.flags;
++        __atomic_thread_fence( __ATOMIC_ACQUIRE );
++        if (ReadNoFence64( &object->seq ) == seq) break;
++    }
++    return object_id == id;
++}
++
++/* Flags that must be set (and nothing from SOCK_SHM_FAST_BLOCKERS) for a synchronous
++ * nonblocking datagram receive or send to be done without calling the server. */
++#define SOCK_SHM_FAST_REQUIRED (SOCK_SHM_NONBLOCKING | SOCK_SHM_DGRAM)
++#define SOCK_SHM_FAST_BLOCKERS (SOCK_SHM_ERROR | SOCK_SHM_MSG_SELECT | SOCK_SHM_ICMP)
++
++static BOOL sock_shm_fast_ok( const sock_shm_t *state, unsigned int blockers )
++{
++    return (state->flags & (SOCK_SHM_FAST_REQUIRED | SOCK_SHM_FAST_BLOCKERS | blockers)) == SOCK_SHM_FAST_REQUIRED;
++}
++
++/* Synchronous receive on a nonblocking datagram socket with no queued reads.
++ * The server would only reset the read events, which is done afterwards
++ * if any of them is set. Returns STATUS_NOT_SUPPORTED if the server must be used. */
++static NTSTATUS sock_recv_fast( HANDLE handle, IO_STATUS_BLOCK *io, int fd, struct async_recv_ioctl *async,
++                                const sock_shm_t *state )
++{
++    unsigned int reset = (state->pending_events | state->reported_events) & AFD_POLL_READ;
++    ULONG_PTR information = 0;
++    unsigned int options = 0;
++    int unused_fd, needs_close;
++    NTSTATUS status;
++    unsigned int i;
++
++    if (server_get_unix_fd( handle, 0, &unused_fd, &needs_close, NULL, &options )) return STATUS_NOT_SUPPORTED;
++    if (needs_close) close( unused_fd );
++
++    for (i = 0; i < async->count; ++i)
++    {
++        if (!virtual_check_buffer_for_write( async->iov[i].iov_base, async->iov[i].iov_len ))
++        {
++            release_fileio( &async->io );
++            return STATUS_ACCESS_VIOLATION;
++        }
++    }
++
++    status = try_recv( fd, async, &information );
++
++    if (reset)
++    {
++        SERVER_START_REQ( socket_reset_events )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            req->events = AFD_POLL_READ;
++            wine_server_call( req );
++        }
++        SERVER_END_REQ;
++    }
++
++    if (!NT_ERROR(status) && status != STATUS_PENDING)
++        set_sync_iosb( io, status, information, options );
++    release_fileio( &async->io );
++    return status;
++}
++
+ static NTSTATUS sock_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io,
+                            int fd, struct async_recv_ioctl *async, int force_async )
+ {
+@@ -1015,8 +1097,23 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+     async->addr = addr;
+     async->addr_len = addr_len;
+     async->ret_flags = ret_flags;
+-    async->icmp_over_dgram = is_icmp_over_dgram( fd );
+ 
++    if (!force_async && !apc && !apc_user && !(unix_flags & MSG_OOB))
++    {
++        sock_shm_t state;
++
++        if (get_sock_shm_state( handle, &state ) &&
++            sock_shm_fast_ok( &state, SOCK_SHM_READ_QUEUED | SOCK_SHM_RD_SHUTDOWN ))
++        {
++            NTSTATUS status;
++
++            async->icmp_over_dgram = FALSE;
++            if ((status = sock_recv_fast( handle, io, fd, async, &state )) != STATUS_NOT_SUPPORTED)
++                return status;
++        }
++    }
++
++    async->icmp_over_dgram = is_icmp_over_dgram( fd );
+     return sock_recv( handle, event, apc, apc_user, io, fd, async, force_async );
+ }
+ 
+@@ -1351,6 +1448,39 @@ static NTSTATUS sock_ioctl_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+     async->iov_cursor = 0;
+     async->sent_len = 0;
+ 
++    /* Synchronous send on a bound nonblocking datagram socket with no queued writes
++     * and no write events selected: the server would not change any state unless
++     * the send would block, so only that case goes through it. */
++    if (!force_async && !apc && !apc_user && !(unix_flags & MSG_OOB))
++    {
++        sock_shm_t state;
++
++        if (get_sock_shm_state( handle, &state ) &&
++            sock_shm_fast_ok( &state, SOCK_SHM_WRITE_QUEUED | SOCK_SHM_WR_SHUTDOWN ) &&
++            (state.flags & SOCK_SHM_BOUND) &&
++            !((state.mask | state.pending_events | state.reported_events) & AFD_POLL_WRITE))
++        {
++            unsigned int options = 0, status;
++            int unused_fd, needs_close;
++
++            if (!server_get_unix_fd( handle, 0, &unused_fd, &needs_close, NULL, &options ))
++            {
++                if (needs_close) close( unused_fd );
++                status = try_send( fd, async );
++                hack_update_status( handle, &status );
++                if (status != STATUS_DEVICE_NOT_READY)
++                {
++                    if (!NT_ERROR(status) && status != STATUS_PENDING)
++                        set_sync_iosb( io, status, async->sent_len, options );
++                    release_fileio( &async->io );
++                    return status;
++                }
++                async->iov_cursor = 0;
++                async->sent_len = 0;
++            }
++        }
++    }
++
+     return sock_send( handle, event, apc, apc_user, io, fd, async, force_async ? SERVER_SOCKET_IO_FORCE_ASYNC : 0 );
+ }
+ 
+@@ -1702,6 +1832,20 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+                 return status;
+             if (needs_close) close( fd );
+ 
++            /* nothing to report and nothing to reset: no need to ask the server */
++            if (!reset_event)
++            {
++                sock_shm_t state;
++
++                if (get_sock_shm_state( handle, &state ) && !(state.pending_events & state.mask))
++                {
++                    params->flags = 0;
++                    memset( params->status, 0, sizeof(params->status) );
++                    file_complete_async( handle, options, event, apc, apc_user, io, STATUS_SUCCESS, 0 );
++                    return STATUS_SUCCESS;
++                }
++            }
++
+             SERVER_START_REQ( socket_get_events )
+             {
+                 req->handle = wine_server_obj_handle( handle );
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 4ccfc7f..9444457 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -257,6 +257,8 @@ extern int get_inproc_alert_fd(void);
+ extern unsigned int server_wait_for_object( HANDLE handle, BOOL alertable, const LARGE_INTEGER *timeout );
+ extern unsigned int server_queue_process_apc( HANDLE process, const union apc_call *call,
+                                               union apc_result *result );
++extern const shared_object_t *server_get_sock_shm( HANDLE handle, object_id_t *id );
++extern void set_sync_iosb( IO_STATUS_BLOCK *io, NTSTATUS status, ULONG_PTR info, unsigned int options );
+ extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+                                int *needs_close, enum server_fd_type *type, unsigned int *options );
+ extern int wine_server_receive_fd( obj_handle_t *handle );
+diff --git a/server/fd.c b/server/fd.c
+index 4440f7e..e2e911c 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -3160,6 +3160,7 @@ DECL_HANDLER(get_handle_fd)
+             reply->type = fd->fd_ops->get_fd_type( fd );
+             reply->options = fd->options;
+             reply->access = get_handle_access( current->process, req->handle );
++            if (reply->type == FD_TYPE_SOCKET) reply->shm = get_fd_sock_shm_locator( fd );
+             send_client_fd( current->process, unix_fd, req->handle );
+         }
+         release_object( fd );
+diff --git a/server/file.h b/server/file.h
+index c64ac91..d5fb724 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -204,6 +204,7 @@ extern volatile void *alloc_shared_object( mem_size_t shm_size );
+ extern void free_shared_object( volatile void *object_shm );
+ extern void invalidate_shared_object( volatile void *object_shm );
+ extern struct obj_locator get_shared_object_locator( volatile void *object_shm );
++extern struct obj_locator get_fd_sock_shm_locator( struct fd *fd );
+ 
+ #define SHARED_WRITE_BEGIN( object_shm, type )                          \
+     do {                                                                \
+diff --git a/server/protocol.def b/server/protocol.def
+index 4eb22fb..cfd8fe0 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1161,6 +1161,25 @@ typedef volatile struct
+     unsigned int         dpi_context;      /* DPI awareness context */
+ } window_shm_t;
+ 
++typedef volatile struct
++{
++    unsigned int         pending_events;   /* AFD_POLL_* events recorded but not reported yet */
++    unsigned int         reported_events;  /* AFD_POLL_* events reported and not reset yet */
++    unsigned int         mask;             /* AFD_POLL_* event select mask */
++    unsigned int         flags;            /* SOCK_SHM_* flags */
++} sock_shm_t;
++
++#define SOCK_SHM_NONBLOCKING   0x0001  /* socket is nonblocking */
++#define SOCK_SHM_DGRAM         0x0002  /* datagram socket */
++#define SOCK_SHM_BOUND         0x0004  /* socket is bound */
++#define SOCK_SHM_READ_QUEUED   0x0008  /* asyncs are queued for read */
++#define SOCK_SHM_WRITE_QUEUED  0x0010  /* asyncs are queued for write */
++#define SOCK_SHM_RD_SHUTDOWN   0x0020  /* read end is shut down */
++#define SOCK_SHM_WR_SHUTDOWN   0x0040  /* write end is shut down */
++#define SOCK_SHM_ERROR         0x0080  /* socket was reset or aborted */
++#define SOCK_SHM_MSG_SELECT    0x0100  /* events are posted to a window */
++#define SOCK_SHM_ICMP          0x0200  /* ICMP datagram socket */
++
+ typedef volatile union
+ {
+     desktop_shm_t        desktop;
+@@ -1168,6 +1187,7 @@ typedef volatile union
+     input_shm_t          input;
+     class_shm_t          class;
+     window_shm_t         window;
++    sock_shm_t           sock;
+ } object_shm_t;
+ 
+ typedef volatile struct
+@@ -1754,6 +1774,7 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
+     int          cacheable;     /* can fd be cached in the client? */
+     unsigned int access;        /* file access rights */
+     unsigned int options;       /* file open options */
++    struct obj_locator shm;     /* locator for the object shared state (sockets) */
+ @END
+ enum server_fd_type
+ {
+@@ -4558,3 +4579,10 @@ enum fsync_type
+ @REPLY
+     unsigned int   status;              /* enum hwnd_dmabuf_status */
+ @END
++
++
++/* Reset reported socket events after a receive completed in the client */
++@REQ(socket_reset_events)
++    obj_handle_t   handle;              /* socket handle */
++    unsigned int   events;              /* AFD_POLL_* events to reset */
++@END
+diff --git a/server/sock.c b/server/sock.c
+index d12afc0..4532584 100644
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -304,6 +304,7 @@ struct sock
+     unsigned int        reset : 1;   /* did we get a TCP reset? */
+     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
+     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
++    sock_shm_t         *shm;         /* state shared with the client for its fast paths */
+ };
+ 
+ static int is_tcp_socket( struct sock *sock )
+@@ -827,6 +828,41 @@ void sock_init(void)
+     }
+ }
+ 
++/* Publish the state the client fast paths depend on. This must happen before
++ * anything that lets another thread observe a change, i.e. before setting the
++ * event object or replying to the request. */
++static void sock_publish( struct sock *sock )
++{
++    sock_shm_t *shm = sock->shm;
++    unsigned int flags = 0;
++
++    if (!shm) return;
++
++    if (sock->nonblocking) flags |= SOCK_SHM_NONBLOCKING;
++    if (sock->type == WS_SOCK_DGRAM) flags |= SOCK_SHM_DGRAM;
++    if (sock->bound) flags |= SOCK_SHM_BOUND;
++    if (async_queued( &sock->read_q )) flags |= SOCK_SHM_READ_QUEUED;
++    if (async_queued( &sock->write_q )) flags |= SOCK_SHM_WRITE_QUEUED;
++    if (sock->rd_shutdown) flags |= SOCK_SHM_RD_SHUTDOWN;
++    if (sock->wr_shutdown || sock->wr_shutdown_pending) flags |= SOCK_SHM_WR_SHUTDOWN;
++    if (sock->reset || sock->aborted) flags |= SOCK_SHM_ERROR;
++    if (sock->window) flags |= SOCK_SHM_MSG_SELECT;
++    if (sock->proto == WS_IPPROTO_ICMP || sock->proto == WS_IPPROTO_ICMPV6) flags |= SOCK_SHM_ICMP;
++
++    if (shm->pending_events == sock->pending_events && shm->reported_events == sock->reported_events &&
++        shm->mask == sock->mask && shm->flags == flags)
++        return;
++
++    SHARED_WRITE_BEGIN( shm, sock_shm_t )
++    {
++        shared->pending_events = sock->pending_events;
++        shared->reported_events = sock->reported_events;
++        shared->mask = sock->mask;
++        shared->flags = flags;
++    }
++    SHARED_WRITE_END;
++}
++
+ static void sock_reselect( struct sock *sock )
+ {
+     int ev = sock_get_poll_events( sock->fd );
+@@ -835,6 +871,7 @@ static void sock_reselect( struct sock *sock )
+         fprintf(stderr,"sock_reselect(%p): new mask %x\n", sock, ev);
+ 
+     set_fd_events( sock->fd, ev );
++    sock_publish( sock );
+ }
+ 
+ static unsigned int afd_poll_flag_to_win32( unsigned int flags )
+@@ -1363,6 +1400,7 @@ static void post_socket_event( struct sock *sock, enum afd_poll_bit event_bit )
+     {
+         sock->pending_events |= event;
+         sock->reported_events |= event;
++        sock_publish( sock );
+ 
+         if ((sock->mask & event) && sock->event)
+             set_event( sock->event );
+@@ -1784,6 +1822,7 @@ static void sock_destroy( struct object *obj )
+     free_async_queue( &sock->poll_q );
+     if (sock->event) release_object( sock->event );
+     if (sock->fd) release_object( sock->fd );
++    if (sock->shm) free_shared_object( sock->shm );
+ }
+ 
+ static struct sock *create_socket(void)
+@@ -1837,6 +1876,17 @@ static struct sock *create_socket(void)
+     init_async_queue( &sock->poll_q );
+     memset( sock->errors, 0, sizeof(sock->errors) );
+     list_init( &sock->accept_list );
++    if ((sock->shm = alloc_shared_object( sizeof(*sock->shm) )))
++    {
++        SHARED_WRITE_BEGIN( sock->shm, sock_shm_t )
++        {
++            shared->pending_events = 0;
++            shared->reported_events = 0;
++            shared->mask = 0;
++            shared->flags = 0;
++        }
++        SHARED_WRITE_END;
++    }
+     return sock;
+ }
+ 
+@@ -2587,7 +2637,7 @@ static struct accept_req *alloc_accept_req( struct sock *sock, struct sock *acce
+     return req;
+ }
+ 
+-static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
++static void sock_ioctl_internal( struct fd *fd, ioctl_code_t code, struct async *async )
+ {
+     struct sock *sock = get_fd_user( fd );
+     int unix_fd = -1;
+@@ -3764,6 +3814,16 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+     }
+ }
+ 
++static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
++{
++    struct sock *sock = get_fd_user( fd );
++
++    grab_object( sock );
++    sock_ioctl_internal( fd, code, async );
++    sock_publish( sock );
++    release_object( sock );
++}
++
+ static void handle_exclusive_poll(struct poll_req *req)
+ {
+     unsigned int i;
+@@ -4639,3 +4699,26 @@ DECL_HANDLER(get_udp_endpoints)
+         enum_handles_of_type( &sock_ops, enum_udp_endpoints, &info );
+     }
+ }
++
++struct obj_locator get_fd_sock_shm_locator( struct fd *fd )
++{
++    struct obj_locator locator = {0};
++    struct sock *sock = get_fd_user( fd );
++
++    if (sock && sock->obj.ops == &sock_ops && sock->shm)
++        locator = get_shared_object_locator( sock->shm );
++    return locator;
++}
++
++DECL_HANDLER(socket_reset_events)
++{
++    struct sock *sock = (struct sock *)get_handle_obj( current->process, req->handle, 0, &sock_ops );
++    unsigned int events = req->events & (AFD_POLL_READ | AFD_POLL_OOB);
++
++    if (!sock) return;
++
++    sock->pending_events &= ~events;
++    sock->reported_events &= ~events;
++    sock_reselect( sock );
++    release_object( sock );
++}

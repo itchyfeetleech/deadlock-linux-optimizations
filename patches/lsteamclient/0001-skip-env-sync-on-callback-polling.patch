@@ -1,0 +1,70 @@
+diff --git a/lsteamclient/steamclient_main.c b/lsteamclient/steamclient_main.c
+index 5aa235d..c2a51f3 100644
+--- a/lsteamclient/steamclient_main.c
++++ b/lsteamclient/steamclient_main.c
+@@ -356,6 +356,8 @@ static BOOL get_env_win(const WCHAR *name, char *value, unsigned int size)
+     return TRUE;
+ }
+ 
++static BOOL steamclient_loaded;
++
+ static int load_steamclient(void)
+ {
+     char steam_app_id[4096], ignore_child_processes[4096];
+@@ -382,10 +384,20 @@ static int load_steamclient(void)
+         WSAStartup(0x202, &data);
+         wsa_initialized = TRUE;
+     }
++    steamclient_loaded = TRUE;
+     SetLastError(saved_err);
+     return 1;
+ }
+ 
++/* For the calls a game makes every frame (callback polling). load_steamclient() reads SteamAppId
++ * and IgnoreChildProcesses with GetEnvironmentVariableW, a linear scan of the whole environment
++ * (a few microseconds with a Steam runtime environment), and makes a Unix call to sync them;
++ * those values matter when interfaces are created, which keeps the full path. */
++static inline int load_steamclient_fast(void)
++{
++    return steamclient_loaded || load_steamclient();
++}
++
+ void *CDECL CreateInterface(const char *name, int *return_code)
+ {
+     struct steamclient_CreateInterface_params params = {.name = name, .return_code = return_code};
+@@ -485,7 +497,7 @@ int8_t CDECL Steam_FreeLastCallback( int32_t pipe )
+     struct steamclient_Steam_FreeLastCallback_params params = {.pipe = pipe};
+     TRACE( "%u\n", pipe );
+ 
+-    if (!load_steamclient()) return 0;
++    if (!load_steamclient_fast()) return 0;
+ 
+     HeapFree( GetProcessHeap(), 0, last_callback_data );
+     last_callback_data = NULL;
+@@ -509,7 +521,7 @@ int8_t CDECL Steam_BGetCallback( int32_t pipe, w_CallbackMsg_t *win_msg, int32_t
+ 
+     TRACE("%u, %p, %p\n", pipe, win_msg, ignored);
+ 
+-    if (!load_steamclient()) return 0;
++    if (!load_steamclient_fast()) return 0;
+ 
+     execute_pending_callbacks();
+ 
+@@ -569,7 +581,7 @@ int8_t CDECL Steam_GetAPICallResult( int32_t pipe, uint64_t call, void *w_callba
+ 
+     TRACE( "%u, x, %p, %u, %u, %p\n", pipe, w_callback, w_callback_len, id, failed );
+ 
+-    if (!load_steamclient()) return FALSE;
++    if (!load_steamclient_fast()) return FALSE;
+     STEAMCLIENT_CALL( steamclient_Steam_GetAPICallResult, &params );
+     return params._ret;
+ }
+@@ -579,7 +591,7 @@ void CDECL Steam_ReleaseThreadLocalMemory(int bThreadExit)
+     struct steamclient_Steam_ReleaseThreadLocalMemory_params params = {.thread_exit = bThreadExit};
+     TRACE("%d\n", bThreadExit);
+ 
+-    if (!load_steamclient()) return;
++    if (!load_steamclient_fast()) return;
+ 
+     STEAMCLIENT_CALL( steamclient_Steam_ReleaseThreadLocalMemory, &params );
+ }

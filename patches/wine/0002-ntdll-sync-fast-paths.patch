@@ -1,0 +1,751 @@
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 729d7cb..38fe931 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -474,7 +474,11 @@ struct srw_lock
+     /* bit 0 - if the lock is held exclusive. bit 1.. - number of exclusive waiters. */
+     short exclusive_waiters;
+ 
+-    /* Number of owners.
++    /* Bits 0..14: number of owners (an exclusive owner counts as one).
++     * Bit 15 (SRW_SHARED_WAITING): at least one thread is waiting for shared
++     * access. Shared waiters only wait while exclusive_waiters is nonzero,
++     * which only becomes zero in RtlReleaseSRWLockExclusive(), so that is the
++     * only place that has to wake them, and only when this bit is set.
+      *
+      * Sadly Windows has no equivalent to FUTEX_WAIT_BITSET, so in order to wake
+      * up *only* exclusive or *only* shared waiters (and thus avoid spurious
+@@ -489,6 +493,13 @@ struct srw_lock
+ };
+ C_ASSERT( sizeof(struct srw_lock) == 4 );
+ 
++#define SRW_SHARED_WAITING 0x8000
++#define SRW_OWNERS_MASK    0x7fff
++/* Lock word value for "held exclusive, nobody waiting". */
++#define SRW_EXCLUSIVE_FREE_TO_HELD 0x00010001
++/* Windows spins before blocking on a contended SRW lock; do the same. */
++#define SRW_SPIN_COUNT 256
++
+ /***********************************************************************
+  *              RtlInitializeSRWLock (NTDLL.@)
+  *
+@@ -504,34 +515,50 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
+     lock->Ptr = NULL;
+ }
+ 
+-/***********************************************************************
+- *              RtlAcquireSRWLockExclusive (NTDLL.@)
+- *
+- * NOTES
+- *  Unlike RtlAcquireResourceExclusive this function doesn't allow
+- *  nested calls from the same thread. "Upgrading" a shared access lock
+- *  to an exclusive access lock also doesn't seem to be supported.
+- */
+-void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
++static inline BOOL srw_spin_allowed(void)
++{
++    return NtCurrentTeb()->Peb->NumberOfProcessors > 1;
++}
++
++static void acquire_srw_exclusive_contended( RTL_SRWLOCK *lock )
+ {
+     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
++    union { struct srw_lock s; LONG l; } old, new;
++    unsigned int spin;
++
++    /* Spin while the lock is held, without registering as a waiter yet. */
++    if (srw_spin_allowed())
++    {
++        for (spin = 0; spin < SRW_SPIN_COUNT; spin++)
++        {
++            old.l = ReadNoFence( u.l );
++            if (!(old.s.owners & SRW_OWNERS_MASK))
++            {
++                new = old;
++                new.s.owners |= 1;
++                new.s.exclusive_waiters |= 1;
++                if (InterlockedCompareExchange( u.l, new.l, old.l ) == old.l) return;
++                continue;
++            }
++            YieldProcessor();
++        }
++    }
+ 
+     InterlockedExchangeAdd16( &u.s->exclusive_waiters, 2 );
+ 
+     for (;;)
+     {
+-        union { struct srw_lock s; LONG l; } old, new;
+         BOOL wait;
+ 
+         do
+         {
+-            old.s = *u.s;
+-            new.s = old.s;
++            old.l = ReadNoFence( u.l );
++            new = old;
+ 
+-            if (!old.s.owners)
++            if (!(old.s.owners & SRW_OWNERS_MASK))
+             {
+                 /* Not locked exclusive or shared. We can try to grab it. */
+-                new.s.owners = 1;
++                new.s.owners |= 1;
+                 new.s.exclusive_waiters -= 2;
+                 new.s.exclusive_waiters |= 1;
+                 wait = FALSE;
+@@ -548,6 +575,21 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
+     }
+ }
+ 
++/***********************************************************************
++ *              RtlAcquireSRWLockExclusive (NTDLL.@)
++ *
++ * NOTES
++ *  Unlike RtlAcquireResourceExclusive this function doesn't allow
++ *  nested calls from the same thread. "Upgrading" a shared access lock
++ *  to an exclusive access lock also doesn't seem to be supported.
++ */
++void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
++{
++    /* Fast path: one atomic operation when the lock is free and nobody waits. */
++    if (!InterlockedCompareExchange( (LONG *)lock, SRW_EXCLUSIVE_FREE_TO_HELD, 0 )) return;
++    acquire_srw_exclusive_contended( lock );
++}
++
+ /***********************************************************************
+  *              RtlAcquireSRWLockShared (NTDLL.@)
+  *
+@@ -558,15 +600,16 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
+ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
+ {
+     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
++    union { struct srw_lock s; LONG l; } old, new;
++    unsigned int spin = srw_spin_allowed() ? 0 : SRW_SPIN_COUNT;
+ 
+     for (;;)
+     {
+-        union { struct srw_lock s; LONG l; } old, new;
+         BOOL wait;
+ 
+         do
+         {
+-            old.s = *u.s;
++            old.l = ReadNoFence( u.l );
+             new = old;
+ 
+             if (!old.s.exclusive_waiters)
+@@ -576,8 +619,15 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
+                 ++new.s.owners;
+                 wait = FALSE;
+             }
++            else if (spin < SRW_SPIN_COUNT)
++            {
++                spin++;
++                YieldProcessor();
++                goto retry;
++            }
+             else
+             {
++                new.s.owners |= SRW_SHARED_WAITING;
+                 wait = TRUE;
+             }
+         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+@@ -585,6 +635,7 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
+         if (!wait) return;
+         terminate_process_on_shutdown();
+         RtlWaitOnAddress( u.s, &new.s, sizeof(struct srw_lock), NULL );
++retry:  ;
+     }
+ }
+ 
+@@ -596,20 +647,25 @@ void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
+     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
+     union { struct srw_lock s; LONG l; } old, new;
+ 
++    /* Fast path: held exclusive and nobody waiting. */
++    if (InterlockedCompareExchange( u.l, 0, SRW_EXCLUSIVE_FREE_TO_HELD ) == SRW_EXCLUSIVE_FREE_TO_HELD) return;
++
+     do
+     {
+-        old.s = *u.s;
++        old.l = ReadNoFence( u.l );
+         new = old;
+ 
+         if (!(old.s.exclusive_waiters & 1)) ERR("Lock %p is not owned exclusive!\n", lock);
+ 
+-        new.s.owners = 0;
++        new.s.owners &= SRW_SHARED_WAITING;
+         new.s.exclusive_waiters &= ~1;
++        /* the shared waiters get woken below if no exclusive waiter is left */
++        if (!new.s.exclusive_waiters) new.s.owners = 0;
+     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+ 
+     if (new.s.exclusive_waiters)
+         RtlWakeAddressSingle( &u.s->owners );
+-    else
++    else if (old.s.owners & SRW_SHARED_WAITING)
+         RtlWakeAddressAll( u.s );
+ }
+ 
+@@ -623,16 +679,16 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
+ 
+     do
+     {
+-        old.s = *u.s;
++        old.l = ReadNoFence( u.l );
+         new = old;
+ 
+         if (old.s.exclusive_waiters & 1) ERR("Lock %p is owned exclusive!\n", lock);
+-        else if (!old.s.owners) ERR("Lock %p is not owned shared!\n", lock);
++        else if (!(old.s.owners & SRW_OWNERS_MASK)) ERR("Lock %p is not owned shared!\n", lock);
+ 
+         --new.s.owners;
+     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+ 
+-    if (!new.s.owners && new.s.exclusive_waiters)
++    if (!(new.s.owners & SRW_OWNERS_MASK) && new.s.exclusive_waiters)
+         RtlWakeAddressSingle( &u.s->owners );
+ }
+ 
+@@ -651,13 +707,13 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
+ 
+     do
+     {
+-        old.s = *u.s;
++        old.l = ReadNoFence( u.l );
+         new.s = old.s;
+ 
+-        if (!old.s.owners)
++        if (!(old.s.owners & SRW_OWNERS_MASK))
+         {
+             /* Not locked exclusive or shared. We can try to grab it. */
+-            new.s.owners = 1;
++            new.s.owners |= 1;
+             new.s.exclusive_waiters |= 1;
+             ret = TRUE;
+         }
+@@ -681,7 +737,7 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
+ 
+     do
+     {
+-        old.s = *u.s;
++        old.l = ReadNoFence( u.l );
+         new.s = old.s;
+ 
+         if (!old.s.exclusive_waiters)
+@@ -834,23 +890,30 @@ struct futex_entry
+ 
+ struct futex_queue
+ {
+-    struct list queue;
+     LONG lock;
++    LONG waiters;      /* entries in queue; written under lock, read without it by the wakers */
++    struct list queue;
++    char pad[64 - 2 * sizeof(LONG) - sizeof(struct list)];
+ };
++C_ASSERT( sizeof(struct futex_queue) == 64 );
+ 
+-static struct futex_queue futex_queues[256];
++static struct futex_queue futex_queues[1024] DECLSPEC_ALIGN(64);
+ 
+ static struct futex_queue *get_futex_queue( const void *addr )
+ {
+-    ULONG_PTR val = (ULONG_PTR)addr;
++    /* Mix all address bits: objects at the same offset in different pages
++     * (thread stacks, per-thread data) must not land in the same bucket. */
++    ULONG64 val = ((ULONG_PTR)addr >> 2) * 0x9e3779b97f4a7c15ull;
+ 
+-    return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
++    return &futex_queues[val >> (64 - 10)];
+ }
+ 
+ static void spin_lock( LONG *lock )
+ {
+     while (InterlockedCompareExchange( lock, -1, 0 ))
+-        YieldProcessor();
++    {
++        do YieldProcessor(); while (ReadNoFence( lock ));
++    }
+ }
+ 
+ static void spin_unlock( LONG *lock )
+@@ -858,6 +921,17 @@ static void spin_unlock( LONG *lock )
+     InterlockedExchange( lock, 0 );
+ }
+ 
++/* Lockless check used by the wake functions. The caller changed the value at
++ * the address before calling us; the full barrier orders that store before
++ * the load of the waiter count. A waiter increments the count with a locked
++ * instruction before it compares the value, so either it sees the new value
++ * or we see it waiting. */
++static inline BOOL futex_queue_empty( struct futex_queue *queue )
++{
++    MemoryBarrier();
++    return !ReadNoFence( &queue->waiters );
++}
++
+ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
+ {
+     switch (size)
+@@ -895,10 +969,14 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+ 
+     spin_lock( &queue->lock );
+ 
++    /* Announce ourselves before comparing, see futex_queue_empty(). */
++    InterlockedIncrement( &queue->waiters );
++
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+ 
+     if (!compare_addr( addr, cmp, size ))
+     {
++        queue->waiters--;
+         spin_unlock( &queue->lock );
+         return STATUS_SUCCESS;
+     }
+@@ -916,7 +994,10 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     {
+         spin_lock( &queue->lock );
+         if (entry.addr)
++        {
+             list_remove( &entry.entry );
++            queue->waiters--;
++        }
+         spin_unlock( &queue->lock );
+     }
+ 
+@@ -940,6 +1021,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+     TRACE("%p\n", addr);
+ 
+     if (!addr) return;
++    if (futex_queue_empty( queue )) return;
+ 
+     spin_lock( &queue->lock );
+ 
+@@ -952,6 +1034,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+         {
+             tid = entry->tid;
+             list_remove( &entry->entry );
++            queue->waiters--;
+             WritePointerRelease( (void * volatile *)&entry->addr, NULL );
+             if (count == ARRAY_SIZE(tids))
+             {
+@@ -981,6 +1064,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+     TRACE("%p\n", addr);
+ 
+     if (!addr) return;
++    if (futex_queue_empty( queue )) return;
+ 
+     spin_lock( &queue->lock );
+ 
+@@ -994,6 +1078,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+             /* Try to buffer wakes, so that we don't make a system call while
+              * holding a spinlock. */
+             tid = entry->tid;
++            queue->waiters--;
+ 
+             /* Remove this entry from the queue, so that a simultaneous call to
+              * RtlWakeAddressSingle() will not also wake it—two simultaneous
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 1413f7f..b03f232 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -8365,6 +8365,8 @@ NTSTATUS WINAPI NtQueryObject( HANDLE handle, OBJECT_INFORMATION_CLASS info_clas
+ 
+         if (len < sizeof(*p)) return STATUS_INVALID_BUFFER_SIZE;
+ 
++        if (inproc_sync_is_parked( handle )) return STATUS_INVALID_HANDLE;
++        inproc_sync_mark_escaped( handle );
+         SERVER_START_REQ( set_handle_info )
+         {
+             req->handle = wine_server_obj_handle( handle );
+diff --git a/dlls/ntdll/unix/registry.c b/dlls/ntdll/unix/registry.c
+index 6b4457d..1cb1c20 100644
+--- a/dlls/ntdll/unix/registry.c
++++ b/dlls/ntdll/unix/registry.c
+@@ -892,6 +892,7 @@ NTSTATUS WINAPI NtNotifyChangeMultipleKeys( HANDLE key, ULONG count, OBJECT_ATTR
+     SERVER_START_REQ( set_registry_notification )
+     {
+         req->hkey    = wine_server_obj_handle( key );
++        inproc_sync_mark_escaped( event );
+         req->event   = wine_server_obj_handle( event );
+         req->subtree = subtree;
+         req->filter  = filter;
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 8a02609..1261976 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1940,6 +1940,12 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+ 
+     if (dest) *dest = 0;
+ 
++    if (source_process == NtCurrentProcess())
++    {
++        if (inproc_sync_is_parked( source )) return STATUS_INVALID_HANDLE;
++        inproc_sync_mark_escaped( source );
++    }
++
+     if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())
+     {
+         union apc_call call;
+@@ -2037,6 +2043,11 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
+         return STATUS_SUCCESS;
+ 
++    {
++        NTSTATUS status;
++        if (inproc_sync_park_event( handle, &status )) return status;
++    }
++
+     /* hold fd_cache_mutex to prevent the fd from being added again between the
+      * call to remove_fd_from_cache and close_handle */
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index 0a9ebb8..e4c7458 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -1678,6 +1678,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ 
+             TRACE( "event %p, mask %#x\n", params->event, params->mask );
+             if (out_size) FIXME( "unexpected output size %u\n", out_size );
++            if (in_size >= sizeof(*params)) inproc_sync_mark_escaped( params->event );
+ 
+             status = STATUS_BAD_DEVICE_TYPE;
+             break;
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index f8d0a95..6c9426d 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -541,9 +541,26 @@ struct inproc_sync
+     int            fd;        /* unix file descriptor */
+     unsigned int   access;    /* handle access rights */
+     unsigned short type;      /* enum inproc_sync_type as short to save space */
+-    unsigned short closed;    /* fd has been closed but sync is still referenced */
++    unsigned char  closed;    /* fd has been closed but sync is still referenced */
++    unsigned char  pool;      /* EVENT_POOL_* state of an anonymous event */
+ };
+ 
++/* Anonymous, unshared events whose handle the application closed are kept
++ * open and handed out again by NtCreateEvent(), which saves the create_event,
++ * get_inproc_sync_fd and close_handle server round trips. */
++#define EVENT_POOL_NONE    0  /* not eligible */
++#define EVENT_POOL_AUTO    1  /* eligible, auto-reset */
++#define EVENT_POOL_MANUAL  2  /* eligible, manual-reset */
++#define EVENT_POOL_PARKED  3  /* closed by the app, sitting in the pool */
++#define EVENT_POOL_SEM     4  /* eligible semaphore */
++#define EVENT_POOL_MAX     32
++
++static pthread_mutex_t event_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
++static HANDLE event_pool[2][EVENT_POOL_MAX];
++static unsigned int event_pool_count[2];
++static struct { HANDLE handle; ULONG max; } sem_pool[EVENT_POOL_MAX];
++static unsigned int sem_pool_count;
++
+ #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
+ #define INPROC_SYNC_CACHE_ENTRIES     128
+ 
+@@ -604,6 +621,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync
+     cache->access = sync->access;
+     cache->type = sync->type;
+     cache->closed = sync->closed;
++    cache->pool = EVENT_POOL_NONE;
+     /* Make sure we set the other members before the refcount; this store needs
+      * release semantics [paired with the load in get_cached_inproc_sync()].
+      * Set the refcount to 2 (one for the handle, one for the caller). */
+@@ -682,6 +700,7 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
++            sync->pool = EVENT_POOL_NONE;
+         }
+     }
+     SERVER_END_REQ;
+@@ -724,6 +743,11 @@ static NTSTATUS get_inproc_sync( HANDLE handle, enum inproc_sync_type desired_ty
+         server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+     }
+ 
++    if (sync->pool == EVENT_POOL_PARKED)
++    {
++        release_inproc_sync( sync );
++        return STATUS_INVALID_HANDLE;
++    }
+     if (desired_type != INPROC_SYNC_UNKNOWN && desired_type != sync->type)
+     {
+         release_inproc_sync( sync );
+@@ -780,6 +804,173 @@ void close_inproc_sync( HANDLE handle )
+     }
+ }
+ 
++/* caller holds event_pool_mutex (uninterrupted section) */
++static void unlist_parked( HANDLE handle )
++{
++    unsigned int i, j;
++
++    for (i = 0; i < 2; i++)
++        for (j = 0; j < event_pool_count[i]; j++)
++            if (event_pool[i][j] == handle) event_pool[i][j] = event_pool[i][--event_pool_count[i]];
++    for (j = 0; j < sem_pool_count; j++)
++        if (sem_pool[j].handle == handle) sem_pool[j] = sem_pool[--sem_pool_count];
++}
++
++/* the handle may be shared or referenced by the server from now on; a parked
++ * (closed) handle passed here by a buggy application is taken out of the pool
++ * and simply stays open */
++void inproc_sync_mark_escaped( HANDLE handle )
++{
++    struct inproc_sync *cache;
++    sigset_t pool_sigset;
++
++    if (inproc_device_fd < 0 || do_fsync() || !handle || is_pseudo_handle( handle )) return;
++    if ((cache = get_cached_inproc_sync( handle )))
++    {
++        if (cache->pool == EVENT_POOL_PARKED)
++        {
++            server_enter_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++            unlist_parked( handle );
++            server_leave_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++        }
++        cache->pool = EVENT_POOL_NONE;
++        release_inproc_sync( cache );
++    }
++}
++
++/* the application closed this handle already */
++BOOL inproc_sync_is_parked( HANDLE handle )
++{
++    struct inproc_sync *cache;
++    BOOL ret = FALSE;
++
++    if (inproc_device_fd < 0 || do_fsync() || !handle || is_pseudo_handle( handle )) return FALSE;
++    if ((cache = get_cached_inproc_sync( handle )))
++    {
++        ret = cache->pool == EVENT_POOL_PARKED;
++        release_inproc_sync( cache );
++    }
++    return ret;
++}
++
++/* called by NtClose(); returns TRUE if the handle was parked in the pool */
++BOOL inproc_sync_park_event( HANDLE handle, NTSTATUS *status )
++{
++    struct inproc_sync *cache;
++    sigset_t pool_sigset;
++    BOOL ret = FALSE;
++    int manual;
++
++    if (inproc_device_fd < 0 || do_fsync()) return FALSE;
++    if (!(cache = get_cached_inproc_sync( handle ))) return FALSE;
++
++    if (cache->pool == EVENT_POOL_PARKED)
++    {
++        /* closing a closed handle */
++        *status = STATUS_INVALID_HANDLE;
++        ret = TRUE;
++    }
++    /* one reference for the handle, one for us: nobody is using it right now */
++    else if ((cache->pool == EVENT_POOL_AUTO || cache->pool == EVENT_POOL_MANUAL) &&
++             ReadNoFence( &cache->refcount ) == 2)
++    {
++        manual = cache->pool == EVENT_POOL_MANUAL;
++        server_enter_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++        if (event_pool_count[manual] < EVENT_POOL_MAX)
++        {
++            cache->pool = EVENT_POOL_PARKED;
++            event_pool[manual][event_pool_count[manual]++] = handle;
++            *status = STATUS_SUCCESS;
++            ret = TRUE;
++        }
++        server_leave_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++    }
++    else if (cache->pool == EVENT_POOL_SEM && ReadNoFence( &cache->refcount ) == 2)
++    {
++        SEMAPHORE_BASIC_INFORMATION info;
++
++        /* only park semaphores with count 0, there is no ioctl to lower it */
++        if (!linux_query_semaphore_obj( cache->fd, &info ) && !info.CurrentCount)
++        {
++            server_enter_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++            if (sem_pool_count < EVENT_POOL_MAX)
++            {
++                cache->pool = EVENT_POOL_PARKED;
++                sem_pool[sem_pool_count].handle = handle;
++                sem_pool[sem_pool_count].max = info.MaximumCount;
++                sem_pool_count++;
++                *status = STATUS_SUCCESS;
++                ret = TRUE;
++            }
++            server_leave_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++        }
++    }
++    release_inproc_sync( cache );
++    return ret;
++}
++
++static BOOL sync_attr_poolable( ACCESS_MASK access, ACCESS_MASK all_access, const OBJECT_ATTRIBUTES *attr )
++{
++    if (inproc_device_fd < 0 || do_fsync()) return FALSE;
++    if (access != all_access) return FALSE;
++    if (!attr) return TRUE;
++    return !attr->ObjectName && !attr->RootDirectory && !attr->SecurityDescriptor &&
++           !(attr->Attributes & OBJ_INHERIT);
++}
++
++static HANDLE unpark_event( BOOL manual, BOOLEAN state )
++{
++    struct inproc_sync *cache;
++    sigset_t pool_sigset;
++    HANDLE handle = 0;
++
++    server_enter_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++    if (event_pool_count[manual]) handle = event_pool[manual][--event_pool_count[manual]];
++    server_leave_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++    if (!handle) return 0;
++
++    if (!(cache = get_cached_inproc_sync( handle ))) return 0;
++    if (cache->pool == EVENT_POOL_PARKED &&
++        !(state ? linux_set_event_obj( cache->fd, NULL ) : linux_reset_event_obj( cache->fd, NULL )))
++    {
++        cache->pool = manual ? EVENT_POOL_MANUAL : EVENT_POOL_AUTO;
++        release_inproc_sync( cache );
++        return handle;
++    }
++    release_inproc_sync( cache );
++    return 0;
++}
++
++static HANDLE unpark_semaphore( LONG initial, LONG max )
++{
++    struct inproc_sync *cache;
++    sigset_t pool_sigset;
++    HANDLE handle = 0;
++    unsigned int i;
++
++    server_enter_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++    for (i = sem_pool_count; i--;)
++    {
++        if (sem_pool[i].max != max) continue;
++        handle = sem_pool[i].handle;
++        sem_pool[i] = sem_pool[--sem_pool_count];
++        break;
++    }
++    server_leave_uninterrupted_section( &event_pool_mutex, &pool_sigset );
++    if (!handle) return 0;
++
++    if (!(cache = get_cached_inproc_sync( handle ))) return 0;
++    if (cache->pool == EVENT_POOL_PARKED &&
++        !(initial ? linux_release_semaphore_obj( cache->fd, initial, NULL ) : STATUS_SUCCESS))
++    {
++        cache->pool = EVENT_POOL_SEM;
++        release_inproc_sync( cache );
++        return handle;
++    }
++    release_inproc_sync( cache );
++    return 0;
++}
++
+ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
+ {
+     struct inproc_sync stack, *sync;
+@@ -999,6 +1190,7 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL poolable;
+ 
+     TRACE( "access %#x, name %s, initial %d, max %d\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", initial, max );
+@@ -1007,6 +1199,13 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
+     if (max <= 0 || initial < 0 || initial > max) return STATUS_INVALID_PARAMETER;
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
++    if ((poolable = sync_attr_poolable( access, SEMAPHORE_ALL_ACCESS, attr )) &&
++        (*handle = unpark_semaphore( initial, max )))
++    {
++        free( objattr );
++        return STATUS_SUCCESS;
++    }
++
+     SERVER_START_REQ( create_semaphore )
+     {
+         req->access  = access;
+@@ -1019,6 +1218,17 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
+     SERVER_END_REQ;
+ 
+     free( objattr );
++
++    if (!ret && poolable)
++    {
++        struct inproc_sync stack, *sync;
++
++        if (!get_inproc_sync( *handle, INPROC_SYNC_SEMAPHORE, 0, &stack, &sync ))
++        {
++            if (sync != &stack) sync->pool = EVENT_POOL_SEM;
++            release_inproc_sync( sync );
++        }
++    }
+     return ret;
+ }
+ 
+@@ -1125,6 +1335,7 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL poolable;
+ 
+     TRACE( "access %#x, name %s, type %u, state %u\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", type, state );
+@@ -1133,6 +1344,13 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
++    if ((poolable = sync_attr_poolable( access, EVENT_ALL_ACCESS, attr )) &&
++        (*handle = unpark_event( type == NotificationEvent, state )))
++    {
++        free( objattr );
++        return STATUS_SUCCESS;
++    }
++
+     SERVER_START_REQ( create_event )
+     {
+         req->access = access;
+@@ -1145,6 +1363,18 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+     SERVER_END_REQ;
+ 
+     free( objattr );
++
++    if (!ret && poolable)
++    {
++        struct inproc_sync stack, *sync;
++
++        /* fetch the fd now; the first Set/Wait would do it anyway */
++        if (!get_inproc_sync( *handle, INPROC_SYNC_EVENT, 0, &stack, &sync ))
++        {
++            if (sync != &stack) sync->pool = type == NotificationEvent ? EVENT_POOL_MANUAL : EVENT_POOL_AUTO;
++            release_inproc_sync( sync );
++        }
++    }
+     return ret;
+ }
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 6ef9efa..4ccfc7f 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -424,6 +424,9 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
+ extern void dbg_init(void);
+ 
+ extern void close_inproc_sync( HANDLE handle );
++extern void inproc_sync_mark_escaped( HANDLE handle );
++extern BOOL inproc_sync_is_parked( HANDLE handle );
++extern BOOL inproc_sync_park_event( HANDLE handle, NTSTATUS *status );
+ 
+ extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
+                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
+@@ -496,6 +499,7 @@ static inline struct async_data server_async( HANDLE handle, struct async_fileio
+                                               PIO_APC_ROUTINE apc, void *apc_context, client_ptr_t iosb )
+ {
+     struct async_data async;
++    if (event) inproc_sync_mark_escaped( event );
+     async.handle      = wine_server_obj_handle( handle );
+     async.user        = wine_server_client_ptr( user );
+     async.iosb        = iosb;
